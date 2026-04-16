@@ -96,14 +96,8 @@ class SlackAdapter(BasePlatformAdapter):
         # Track pending approval message_ts → resolved flag to prevent
         # double-clicks on approval buttons.
         self._approval_resolved: Dict[str, bool] = {}
-        # Track timestamps of messages sent by the bot so we can respond
-        # to thread replies even without an explicit @mention.
-        self._bot_message_ts: set = set()
-        self._BOT_TS_MAX = 5000  # cap to avoid unbounded growth
-        # Track threads where the bot has been @mentioned — once mentioned,
-        # respond to ALL subsequent messages in that thread automatically.
-        self._mentioned_threads: set = set()
-        self._MENTIONED_THREADS_MAX = 5000
+        # (Removed: _bot_message_ts and _mentioned_threads — bot now requires
+        # an explicit @mention for every message, including thread replies.)
         # Assistant thread metadata keyed by (channel_id, thread_ts). Slack's
         # AI Assistant lifecycle events can arrive before/alongside message
         # events, and they carry the user/thread identity needed for stable
@@ -288,19 +282,7 @@ class SlackAdapter(BasePlatformAdapter):
 
                 last_result = await self._get_client(chat_id).chat_postMessage(**kwargs)
 
-            # Track the sent message ts so we can auto-respond to thread
-            # replies without requiring @mention.
             sent_ts = last_result.get("ts") if last_result else None
-            if sent_ts:
-                self._bot_message_ts.add(sent_ts)
-                # Also register the thread root so replies-to-my-replies work
-                if thread_ts:
-                    self._bot_message_ts.add(thread_ts)
-                if len(self._bot_message_ts) > self._BOT_TS_MAX:
-                    excess = len(self._bot_message_ts) - self._BOT_TS_MAX // 2
-                    for old_ts in list(self._bot_message_ts)[:excess]:
-                        self._bot_message_ts.discard(old_ts)
-
             return SendResult(
                 success=True,
                 message_id=sent_ts,
@@ -1021,34 +1003,13 @@ class SlackAdapter(BasePlatformAdapter):
             elif not self._slack_require_mention():
                 pass  # Mention requirement disabled globally for Slack
             elif not is_mentioned:
-                reply_to_bot_thread = (
-                    is_thread_reply and event_thread_ts in self._bot_message_ts
-                )
-                in_mentioned_thread = (
-                    event_thread_ts is not None
-                    and event_thread_ts in self._mentioned_threads
-                )
-                has_session = (
-                    is_thread_reply
-                    and self._has_active_session_for_thread(
-                        channel_id=channel_id,
-                        thread_ts=event_thread_ts,
-                        user_id=user_id,
-                    )
-                )
-                if not reply_to_bot_thread and not in_mentioned_thread and not has_session:
-                    return
+                # @mention required for every message — no thread-membership
+                # or session-based exceptions.
+                return
 
         if is_mentioned:
             # Strip the bot mention from the text
             text = text.replace(f"<@{bot_uid}>", "").strip()
-            # Register this thread so all future messages auto-trigger the bot
-            if event_thread_ts:
-                self._mentioned_threads.add(event_thread_ts)
-                if len(self._mentioned_threads) > self._MENTIONED_THREADS_MAX:
-                    to_remove = list(self._mentioned_threads)[:self._MENTIONED_THREADS_MAX // 2]
-                    for t in to_remove:
-                        self._mentioned_threads.discard(t)
 
         # When entering a thread for the first time (no existing session),
         # fetch thread context so the agent understands the conversation.
@@ -1167,12 +1128,6 @@ class SlackAdapter(BasePlatformAdapter):
             thread_id=thread_ts,
         )
 
-        # Per-channel ephemeral prompt
-        from gateway.platforms.base import resolve_channel_prompt
-        _channel_prompt = resolve_channel_prompt(
-            self.config.extra, channel_id, None,
-        )
-
         msg_event = MessageEvent(
             text=text,
             message_type=msg_type,
@@ -1182,7 +1137,6 @@ class SlackAdapter(BasePlatformAdapter):
             media_urls=media_urls,
             media_types=media_types,
             reply_to_message_id=thread_ts if thread_ts != ts else None,
-            channel_prompt=_channel_prompt,
         )
 
         # Only react when bot is directly addressed (DM or @mention).
